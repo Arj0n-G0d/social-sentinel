@@ -4,4 +4,5 @@ neo4j>=5.28,<7
 pydantic>=2.10,<3
 pydantic-settings>=2.7,<3
 httpx>=0.28,<1
+atproto>=0.0.65,<0.1
 pytest>=8.3,<10

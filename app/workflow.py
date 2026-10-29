@@ -1,7 +1,13 @@
 """Context construction is shared by live and deterministic test workflows."""
 import time
+from collections.abc import Sequence
+from app.schemas import Content, Interaction
 
-def contexts(contents: list[dict], interactions: list[dict]):
+def contexts(contents: Sequence[Content | dict], interactions: Sequence[Interaction | dict]):
+    # Workers supply canonical models; Neo4j snapshots supply property mappings.
+    # Both paths use exactly the same context construction and field names.
+    contents = [c.model_dump() if isinstance(c, Content) else c for c in contents]
+    interactions = [i.model_dump() if isinstance(i, Interaction) else i for i in interactions]
     by_id = {c['content_id']: c for c in contents}
     for c in contents:
         """

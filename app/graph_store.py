@@ -1,6 +1,6 @@
 from neo4j import GraphDatabase
 from app.config import Settings
-from app.schemas import AnalysisResult, Dataset
+from app.schemas import ActivityBatch, AnalysisResult
 from app.demo_data import generate_demo_data
 
 
@@ -26,7 +26,7 @@ class GraphStore:
         return [dict(r) for r in records]
 
     # ingest() takes a dataset of users, content, and interactions and saves them into Neo4j, connecting them together.
-    def ingest(self, dataset: Dataset):
+    def ingest(self, dataset: ActivityBatch):
         def write(tx):
             tx.run('''UNWIND $rows AS row MERGE (u:User {user_id: row.user_id})
                       SET u += row''', rows=[u.model_dump() for u in dataset.users]).consume()

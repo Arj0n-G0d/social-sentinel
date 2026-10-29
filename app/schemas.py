@@ -44,10 +44,14 @@ class Interaction(BaseModel):
     created_at: str
     text: str = '' # Stores the message added when sharing a post
 
-class Dataset(BaseModel):
+class ActivityBatch(BaseModel):
+    """Platform-independent ingestion records, also used by the classifier workflow."""
     users: list[User]
     contents: list[Content]
     interactions: list[Interaction]
+
+
+class Dataset(ActivityBatch):
     expected: dict[str, Classification]
 
 

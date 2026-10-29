@@ -146,6 +146,72 @@ This offline command tests fixture classification/scoring without Neo4j and with
 
 These numbers are fixture-derived examples, **not observed LLM predictions**. Real provider output is probabilistic and requires evaluation; the automated safeguards still apply to its validated classifications.
 
+## Reddit polling worker
+
+The worker accepts seed accounts and prints canonical records as JSON lines. It
+does not write to Neo4j or call an LLM. Configure a Reddit OAuth application with
+access to the Reddit Data API, then add these settings to your local `.env`:
+
+```dotenv
+REDDIT_CLIENT_ID=your-client-id
+REDDIT_CLIENT_SECRET=your-client-secret
+REDDIT_USER_AGENT=python:social-sentinel:0.1 (by /u/your_username)
+```
+
+Run a single seed collection or start continuous polling:
+
+```sh
+python -m scripts.poll_social --seed username1 username2 --once
+python -m scripts.poll_social --seed username1 username2 --interval 60 --max-users 100 --max-depth 1
+```
+
+Seeds have depth 0. Observed commenters on their posts enter the `suspicious_pool`
+at depth 1 and are polled beginning with the next cycle. This pool is a discovery
+watchlist; membership does not assert harmful behavior or assign a score. Increase
+`--max-depth` to expand further, or set it to 0 to poll seeds only. `--max-users`
+caps the total pool, including seeds. `--once` runs one cycle, so it prints newly
+discovered users but does not poll those users yet. Stop continuous mode with Ctrl+C.
+
+Each cycle reads recent submitted posts and authored comments, then revisits the
+returned posts' comment trees to discover new participants even when a post's text
+has not changed. `--page-size` (default 25), `--max-pages` (default 2 per listing),
+and `--comment-limit` (default 100 per thread) bound collection. This is a recent
+activity preview, not a complete archive: older posts outside the listing window
+are not watched, and Reddit `more` comment placeholders are not expanded. A busy
+account can outpace the configured listing window. Deleted authors and removed
+content are omitted; inaccessible parent context may remain unavailable. Historical
+records, deletions, and polling state are not persisted in this print-only version.
+
+Output events have `type: User`, `Content`, or `Interaction` and a `record` matching
+the models in `app/schemas.py`. `pool_member` events additionally explain discovery
+and depth. Unchanged records are suppressed with a bounded in-memory cache; edits
+are printed again. Restarting or cache eviction can print an existing record again.
+Account failures are logged to stderr and retried next cycle without stopping other
+users. API requests are spaced and respect rate-limit backoff headers.
+
+The `SocialPlatform` protocol in `app/platforms/base.py` defines `resolve_user`,
+`poll_user`, and `close`. Other adapters return the same `PollResult` and
+`ActivityBatch`, using platform-namespaced IDs. `ActivityBatch` contains the existing
+`User`, `Content`, and `Interaction` types without requiring synthetic expected
+labels. `Dataset` extends it for fixture-only expectations. Live Reddit users set
+`is_synthetic=False`. Reddit posts use IDs such as `reddit:t3_abc`; comments use
+`reddit:t1_xyz`, with their actual immediate parent in `parent_id`. Comments are
+`Content`, not an invented interaction type. Public vote totals do not identify
+individual voters, so this adapter emits no like/dislike interactions or inferred
+shares. Its `interactions` list is currently empty.
+
+The shared classifier context builder accepts these canonical models directly:
+
+```python
+result = platform.poll_user(platform.resolve_user('username'))
+for label, ident, context in contexts(result.activity.contents, result.activity.interactions):
+    # Hand context to a classifier when classification is explicitly enabled later.
+    print(label, ident, context)
+```
+
+Relevant Reddit contracts: [API listings and comments](https://www.reddit.com/dev/api/)
+and [application-only OAuth](https://github.com/reddit-archive/reddit/wiki/OAuth2#application-only-oauth).
+
 ## Tests
 
 ```sh
@@ -173,3 +239,62 @@ This is a local demonstration intended for synthetic data. No authentication, di
 ## Verification in this workspace
 
 The Python 3.13 test run completed with **65 passed, 1 skipped**. The skipped test requires live Neo4j. Docker is not installed in this workspace, so Compose startup and live graph queries were not exercised. No real LLM calls were made; the HTTP contract was tested with a mock transport. The generated example is fixture replay only.
+
+## X polling
+
+Set `X_BEARER_TOKEN` in `.env` to an X API bearer token with access to the
+[user timeline](https://docs.x.com/x-api/users/get-posts),
+[mentions](https://docs.x.com/x-api/users/get-mentions), user lookup, and post lookup endpoints.
+Run a single account from the testing module:
+
+```sh
+python -m app.testing --platform x username
+```
+
+The shared worker also supports X:
+
+```sh
+python -m scripts.poll_social --platform x --seed username --once
+```
+
+The read-only adapter collects recent authored posts and mentions, fetches up to
+two levels of missing reply parents, and discovers authors of returned mentions.
+Mentions include standalone mentions as well as replies; this does not collect
+complete conversation trees. User IDs use stable numeric IDs (`x:user:123`),
+content IDs use `x:post:456`, and replies are comments with their actual parent ID.
+Reposts are skipped; quotes retain their authored text as posts. No likes or
+shares are inferred. Collection is bounded by `--page-size` (5–100, default 25)
+and `--max-pages` (default 2 per timeline). `--comment-limit` applies only to Reddit.
+HTTP failures and wholly failed API payloads propagate to the caller; the shared
+worker retries accounts on later cycles. Partial responses retain available data.
+Requests honor rate-limit reset and retry headers on subsequent calls. No graph
+writes or LLM calls occur. Tests use mocked HTTP, not live X API access.
+
+## Bluesky polling (atproto)
+
+Install the updated dependencies (`python -m pip install -r requirements.txt`).
+The Bluesky adapter uses the Python `atproto` SDK against
+`https://public.api.bsky.app`; public reads require no credentials or login.
+See the [SDK reading guide](https://atproto.blue/guides/reading/) and
+[Bluesky API reference](https://docs.bsky.app/docs/api/app-bsky-feed-get-author-feed).
+
+```sh
+python -m app.testing --platform bluesky alice.bsky.social
+python -m scripts.poll_social --platform bluesky --seed alice.bsky.social --once
+python -m scripts.poll_social --platform bluesky --seed alice.bsky.social --interval 60 --max-depth 1
+```
+
+Handles, @handles, DIDs, and canonical `bluesky:user:did:...` IDs are accepted.
+Users are keyed by stable DIDs; content uses `bluesky:at://...` IDs and preserves
+actual immediate reply parents. Each poll reads up to `--max-pages` author-feed
+pages (`--page-size` 1–100), revisits the returned authored posts' threads, and
+collects returned replies to `--thread-depth` levels (default 2, range 0–100).
+The API may truncate threads; this is a recent activity preview, not an archive.
+Up to two missing ancestor levels are fetched in batches of 25 for context.
+Reply authors enter discovery; context-only authors do not. Reposts, blocked and
+deleted thread placeholders are skipped. Quotes retain the author's post text.
+No likes or shares are inferred, and no database writes or LLM calls occur.
+SDK/network errors propagate to the caller; the shared worker handles account
+failures and retries on later cycles. Reddit's `--comment-limit` does not apply.
+Tests use mocked SDK calls and real atproto models; no live Bluesky access is
+required to run the suite.

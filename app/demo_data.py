@@ -1,8 +1,8 @@
 """Deterministic fictional fixtures. Expected labels NEVER enter real LLM prompts."""
-from app.schemas import Classification, Content, Dataset, Interaction, User
+from app.schemas import Classification, Content, ActivityBatch, Interaction, User
 
 
-def generate_demo_data() -> Dataset:
+def generate_demo_data() -> ActivityBatch:
     users = [User(user_id=f'u{i:02}', display_name=f'Fictional {i:02}') for i in range(1, 21)]
     contents, interactions, expected = [], [], {}
     timestamp = '2026-01-01T12:00:00Z'
@@ -74,4 +74,4 @@ def generate_demo_data() -> Dataset:
     for content in contents[:18]:
         interact(20, content.content_id, 'like')
         interact(18, content.content_id, 'dislike')
-    return Dataset(users=users, contents=contents, interactions=interactions, expected=expected)
+    return ActivityBatch(users=users, contents=contents, interactions=interactions)

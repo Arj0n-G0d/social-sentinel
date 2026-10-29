@@ -14,3 +14,7 @@ class Settings(BaseSettings):
     llm_model: str = ''
     analysis_version: str = 'v1'
     llm_timeout: float = 120
+    reddit_client_id: str = ''
+    reddit_client_secret: str = ''
+    reddit_user_agent: str = ''
+    x_bearer_token: str = ''

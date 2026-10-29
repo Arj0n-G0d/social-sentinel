@@ -111,7 +111,8 @@ def test_chat_completions_request_and_validation(monkeypatch):
         return httpx.Response(200, json={'choices': [{'message': {'content': expected.model_dump_json()}}]})
     actual_client = httpx.Client
     monkeypatch.setattr('app.llm_classifier.httpx.Client', lambda **kwargs: actual_client(transport=httpx.MockTransport(handler), **kwargs))
-    config = Settings(_env_file=None, llm_provider='chat_completions', llm_api_key='test-only-key', llm_model='configured-model')
+    config = Settings(_env_file=None, llm_provider='chat_completions', llm_api_key='test-only-key',
+                      llm_model='configured-model', llm_base_url='https://provider.example/v1')
     classification, raw = ChatCompletionsProvider(config).classify({'text': 'synthetic text'})
     assert classification == expected
     body = json.loads(captured[0].content)
