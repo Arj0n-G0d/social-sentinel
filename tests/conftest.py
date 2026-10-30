@@ -35,6 +35,16 @@ class MemoryStore:
         node.update(result.model_dump(exclude={'classification', 'error'}))
         node.update(result.classification.model_dump())
 
+    def save_user_scores(self, user_id, scores):
+        user = next(u for u in self.data['users'] if u['user_id'] == user_id)
+        user.update(deepcopy({key: value for key, value in scores.items() if key != 'evidence'}))
+
+    def delete_record(self, label, ident):
+        key, id_key = ('contents', 'content_id') if label == 'Content' else ('interactions', 'interaction_id')
+        self.data[key] = [r for r in self.data[key] if r[id_key] != ident]
+        if label == 'Content':
+            self.data['interactions'] = [i for i in self.data['interactions'] if i['target_id'] != ident]
+
     def neighborhood(self, user_id):
         if not any(u['user_id'] == user_id for u in self.data['users']):
             return None

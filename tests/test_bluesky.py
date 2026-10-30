@@ -7,6 +7,7 @@ from atproto.exceptions import AtProtocolError
 
 from app.platforms.bluesky import BlueskyPlatform
 from app.workflow import contexts
+from app.schemas import User
 
 
 DID = 'did:plc:seed'
@@ -32,49 +33,65 @@ def thread(item, **kwargs):
     return models.AppBskyFeedDefs.ThreadViewPost(post=item, **kwargs)
 
 
-def test_bluesky_pagination_threads_parents_and_discovery():
+def test_bluesky_direct_activity_only():
     client = Mock()
     client.get_profile.return_value = NS(did=DID, handle='seed.bsky.social')
-    own = post('own', parent=uri('parent', 'context'))
+    own = post('own')
     reply = post('reply', 'reader', own.uri)
+    nested = post('nested', 'nested', reply.uri)
     client.get_author_feed.side_effect = [
-        NS(feed=[NS(post=own, reason=None), NS(post=post('repost', 'other'), reason=NS())], cursor='next'),
+        NS(feed=[NS(post=own, reason=None), NS(post=post('repost', 'other'), reason=NS()),
+                 NS(post=post('authored-reply', parent=uri('external')), reason=None)], cursor='next'),
         NS(feed=[NS(post=own, reason=None)], cursor='next')]
-    blocked = models.AppBskyFeedDefs.NotFoundPost(uri=uri('gone'), not_found=True)
-    client.get_post_thread.return_value = NS(thread=thread(own, replies=[thread(reply), blocked]))
-    client.get_posts.side_effect = [NS(posts=[post('parent', 'context', uri('grand', 'context'))]),
-                                   NS(posts=[post('grand', 'context')])]
+    client.get_post_thread.return_value = NS(thread=thread(own, replies=[
+        thread(reply, replies=[thread(nested)]), thread(nested),
+        models.AppBskyFeedDefs.NotFoundPost(uri=uri('gone'), not_found=True)]))
+    liker = NS(did='did:plc:liker', handle='liker.bsky.social')
+    sharer = NS(did='did:plc:sharer', handle='sharer.bsky.social')
+    client.get_likes.side_effect = [
+        NS(likes=[NS(actor=liker, created_at='2026-10-25T00:00:01Z')], cursor='next'),
+        NS(likes=[], cursor='next')]
+    client.get_reposted_by.return_value = NS(reposted_by=[sharer], cursor=None)
     platform = BlueskyPlatform(client=client)
-    user = platform.resolve_user('@seed.bsky.social')
-    result = platform.poll_user(user)
-    assert client.get_profile.call_args.args == (DID,)
-    assert client.get_author_feed.call_args.kwargs['cursor'] == 'next'
-    assert client.get_post_thread.call_count == 1
-    assert len(result.activity.contents) == 4
-    assert result.activity.interactions == []
-    assert [u.user_id for u in result.discovered_users] == ['bluesky:user:did:plc:reader']
+    result = platform.poll_user(platform.resolve_user('@seed.bsky.social'))
+    client.get_profile.assert_called_once_with('seed.bsky.social')
+    assert client.get_author_feed.call_args.kwargs['actor'] == DID
+    assert client.get_author_feed.call_args.kwargs['filter'] == 'posts_no_replies'
+    client.get_post_thread.assert_called_once_with(uri=own.uri, depth=1, parent_height=0)
+    client.get_posts.assert_not_called()
+    assert {c.content_id for c in result.activity.contents} == {own.uri, reply.uri}
+    assert {u.user_id for u in result.discovered_users} == {
+        'did:plc:reader', 'did:plc:liker', 'did:plc:sharer'}
+    assert {i.interaction_type for i in result.activity.interactions} == {'like', 'share'}
+    assert all(i.target_id == own.uri for i in result.activity.interactions)
+    by_id = {c.content_id: c for c in result.activity.contents}
+    assert by_id[own.uri].user_id == DID
+    assert by_id[own.uri].parent_id is None
+    assert by_id[reply.uri].user_id == 'did:plc:reader'
+    assert by_id[reply.uri].parent_id == own.uri
+    assert all(i.user_id.startswith('did:') for i in result.activity.interactions)
+    assert client.get_post_thread.call_args.kwargs['uri'] == by_id[own.uri].content_id
+    assert client.get_likes.call_count == 2
+    rows = list(contexts(result.activity.contents, result.activity.interactions))
+    assert next(ctx for _, ident, ctx in rows if ident == reply.uri)['parent_text'] == 'Text own'
     assert all(not u.is_synthetic for u in result.activity.users)
-    rows = list(contexts(result.activity.contents, []))
-    own_context = next(context for _, ident, context in rows if ident == f'bluesky:{own.uri}')
-    assert own_context['parent_text'] == 'Text parent'
-    platform.close()
 
 
-def test_bluesky_ancestors_are_context_only_and_empty_feed():
+def test_bluesky_empty_feed():
     client = Mock()
     client.get_profile.return_value = NS(did=DID, handle='seed.bsky.social')
-    own = post('own', parent=uri('parent', 'context'))
-    client.get_author_feed.return_value = NS(feed=[NS(post=own, reason=None)], cursor=None)
-    client.get_post_thread.return_value = NS(thread=thread(own, parent=thread(post('parent', 'context'))))
-    result = BlueskyPlatform(client=client).poll_user(NS(user_id=DID))
-    assert len(result.activity.contents) == 2
-    assert result.discovered_users == []
-    client.get_posts.assert_not_called()
     client.get_author_feed.return_value = NS(feed=[], cursor=None)
-    assert BlueskyPlatform(client=client).poll_user(NS(user_id=DID)).activity.contents == []
+    result = BlueskyPlatform(client=client).poll_user(User(user_id=DID, display_name='seed.bsky.social', is_synthetic=False))
+    client.get_profile.assert_not_called()
+    assert client.get_author_feed.call_args.kwargs['actor'] == DID
+    assert result.activity.contents == []
+    assert result.discovered_users == []
+    client.get_post_thread.assert_not_called()
+    client.get_likes.assert_not_called()
+    client.get_reposted_by.assert_not_called()
 
 
-@pytest.mark.parametrize('kwargs', [{'page_size': 0}, {'max_pages': 0}, {'thread_depth': 101}])
+@pytest.mark.parametrize('kwargs', [{'page_size': 0}, {'max_pages': 0}])
 def test_bluesky_invalid_limits(kwargs):
     with pytest.raises(ValueError):
         BlueskyPlatform(**kwargs)
@@ -105,7 +122,7 @@ def test_bluesky_sdk_public_transport_and_cleanup():
     request = Request(transport=httpx.MockTransport(handler))
     try:
         platform = BlueskyPlatform(client=Client(base_url='https://public.api.bsky.app', request=request))
-        assert platform.resolve_user('@seed.bsky.social').user_id == f'bluesky:user:{DID}'
+        assert platform.resolve_user('@seed.bsky.social').user_id == DID
     finally:
         request.close()
 
@@ -113,3 +130,33 @@ def test_bluesky_sdk_public_transport_and_cleanup():
     platform._request = Mock(wraps=platform._request)
     platform.close()
     platform._request.close.assert_called_once()
+
+
+def test_repeated_polling_uses_resolved_and_discovered_native_ids():
+    client = Mock()
+    client.get_profile.return_value = NS(did=DID, handle='seed.bsky.social')
+    own = post('own')
+    reply = post('reply', 'reader', own.uri)
+    client.get_author_feed.return_value = NS(feed=[NS(post=own, reason=None)], cursor=None)
+    client.get_post_thread.return_value = NS(thread=thread(own, replies=[thread(reply)]))
+    client.get_likes.return_value = NS(likes=[], cursor=None)
+    client.get_reposted_by.return_value = NS(reposted_by=[], cursor=None)
+    platform = BlueskyPlatform(client=client)
+    user = platform.resolve_user('@seed.bsky.social')
+    assert user.user_id == DID
+    discovered = platform.poll_user(user).discovered_users[0]
+    platform.poll_user(user)
+    client.get_author_feed.return_value = NS(feed=[], cursor=None)
+    platform.poll_user(discovered)
+    client.get_profile.assert_called_once_with('seed.bsky.social')
+    assert [call.kwargs['actor'] for call in client.get_author_feed.call_args_list] == [
+        DID, DID, 'did:plc:reader']
+
+
+@pytest.mark.parametrize('handle', ['handles', 'username', '', '@', 'invalid/handle'])
+def test_invalid_account_input_is_rejected_before_api_call(handle):
+    client = Mock()
+    platform = BlueskyPlatform(client=client)
+    with pytest.raises(ValueError, match='full handle'):
+        platform.resolve_user(handle)
+    client.get_profile.assert_not_called()

@@ -1,6 +1,6 @@
 # Social Sentinel
 
-A runnable Python/FastAPI prototype for a **synthetic** social-media knowledge graph and explainable behavioral review scores. One application generates fixtures, classifies content and interaction context, writes Neo4j, and calculates scores on demand. No platform integration, frontend, broker, or graph analytics service.
+A runnable Python/FastAPI prototype for a **synthetic** social-media knowledge graph and explainable behavioral review scores. The application collects Bluesky activity, classifies content and interaction context, writes Neo4j, and calculates user scores. Synthetic fixtures support offline testing.
 
 Flow: deterministic synthetic data → configurable LLM classification → Neo4j properties → transparent risk scoring → API profiles and graph neighborhoods. Ingest stores the raw graph first; analysis adds validated classification properties. Scores use only the actor's own behavior. Graph connectivity is never a scoring feature.
 
@@ -34,7 +34,7 @@ docker compose down
 
 ## Classifier configuration
 
-The default `LLM_PROVIDER=mock` is **deterministic fixture replay, not an LLM classifier**. It exists solely to run the workflow without credentials. Mock classifications, API analysis summaries, and evidence identify simulated results through `provider: "mock"`, the model identifier, and a `MOCK` explanation. Unknown or changed fixture text produces `UNCERTAIN`, never a keyword-based guess. Expected labels are fixture ground truth for tests, not model predictions or accuracy measurements.
+The default `LLM_PROVIDER=mock` is **deterministic fixture replay, not an LLM classifier**. It exists solely to run the workflow without credentials. Mock classifications, API analysis summaries, and evidence identify simulated results through `provider: "mock"`, the model identifier, and a `MOCK` explanation. Unknown or changed fixture text returns `BENIGN` with all four probabilities set to 0 and an explanation identifying the missing fixture; it contributes no score. Expected labels are fixture ground truth for tests, not model predictions or accuracy measurements.
 
 For real classification, edit `.env` and restart the API:
 
@@ -49,7 +49,7 @@ LLM_TIMEOUT=45
 
 The Gemini adapter appends `/models/{LLM_MODEL}:generateContent`, authenticates with `X-goog-api-key`, and requests JSON output. For Chat Completions, use `LLM_PROVIDER=chat_completions`, set `LLM_BASE_URL` to a compatible API root, and choose a model supporting JSON object mode. The primary classifier in real mode is the configured LLM; there are no keyword rules and no silent fallback to mock. Real mode requires a nonempty key and model.
 
-The adapter requests JSON, validates all fields with Pydantic, and stores the valid raw JSON, parsed properties, provider/model, version, fingerprint, and status. Timeout, HTTP failure, malformed JSON, refusal, or invalid fields become zero-confidence `UNCERTAIN` with `status=error`; they are retried by the next `/analyze`. Complete uncertain results are cached. Secrets and provider error bodies are not returned.
+The adapter requests JSON, validates all fields with Pydantic, and stores the valid raw JSON, parsed properties, provider/model, version, fingerprint, and status. Timeout, HTTP failure, malformed JSON, refusal, or invalid fields produce a `BENIGN` placeholder with all four probabilities set to 0 and `status=error`; they are retried by the next `/analyze`. Successful probability results are cached; error placeholders are not safety judgments. Secrets and provider error bodies are not returned.
 
 The fingerprint covers the text, immediate parent/target and target-parent context, provider endpoint, provider/model, prompt, schema, and analysis version. Unchanged successful analysis is reused; model/context/version changes invalidate it. Expected labels and user identity/graph associations are never sent to the real model. For reproducibility, pin a provider model snapshot when available. Bump `ANALYSIS_VERSION` when intentionally changing analysis semantics.
 
@@ -60,7 +60,7 @@ The JSON request contract follows the [official structured-output documentation]
 With the application running in another terminal:
 
 ```sh
-# Optional: inspect the reproducible raw data and expected testing labels.
+# Optional: inspect reproducible raw activity (users, contents, interactions).
 python -m scripts.generate_demo_data > /tmp/social-sentinel-demo.json
 
 curl -sS -X POST http://localhost:8000/ingest-demo
@@ -79,12 +79,17 @@ curl -sS http://localhost:8000/graph/u05
 python -m scripts.demo
 ```
 
+`generate_demo_data()` returns an `ActivityBatch` containing only users, contents,
+and interactions. Expected probabilities are supplied separately by
+`generate_demo_labels()` for mock replay and tests; they are not part of activity
+exports or ingestion.
+
 There are 20 fictional users, 39 posts/comments, and 42 separate likes/dislikes/shares. Ingest uses `MERGE` and a transaction, so repeating it does not duplicate nodes or edges and retains prior classification properties. Changing the provider from mock to real and calling `/analyze` replaces fixture analyses because fingerprints differ. A fresh full analysis makes 81 calls, performed sequentially. Real model results can differ from expected fixture labels.
 
 | Endpoint | Result |
 | --- | --- |
 | `POST /ingest-demo` | Deterministic fixture counts; raw graph stored |
-| `POST /analyze` | Classified/cached/error/uncertain counts and classifier provenance |
+| `POST /analyze` | Analyzed/cached/error/benign counts and classifier provenance |
 | `GET /users` | User score summaries, category scores/levels, review flags, completion state |
 | `GET /users/{user_id}` | Profile, score breakdown, evidence, exclusions and contributions |
 | `GET /graph/{user_id}` | Nodes/edges in a bounded outgoing neighborhood, plus immediate parent context |
@@ -93,36 +98,59 @@ User score summaries also expose `contains_mock_analysis` (derived from provider
 
 ## Scoring and safeguards
 
-Categories describe the topic: `HATE`, `HARASSMENT`, `VIOLENCE`, `SPAM`, `BENIGN`, or `UNCERTAIN`.
-Intent describes the stance, using four values:
+The provider returns four independent probabilities between 0 and 1:
 
-- `ENDORSEMENT`: supports, promotes, or directly expresses harmful behavior, including authored threats, abuse, and spam.
-- `CONDEMNATION`: opposes harm, including warnings and counter-speech.
-- `NEUTRAL`: ordinary conversation, factual reporting, or discussion without support or opposition.
-- `UNCERTAIN`: insufficient evidence to determine stance; use low confidence. An unknown topic separately uses category `UNCERTAIN`.
+```json
+{"probabilities": {"HATE": 0.91, "HARASSMENT": 0.72, "VIOLENCE": 0.12, "SPAM": 0.03}}
+```
 
-For example, a warning against hate is category `HATE`, intent `CONDEMNATION`, and severity 0. A factual report of a threat is category `VIOLENCE`, intent `NEUTRAL`, and severity 0. A harmful category alone never increases risk.
+The application derives labels at **probability ≥0.5** for each category. This
+example becomes `["HATE", "HARASSMENT"]`. When all four probabilities are below
+0.5, the label is `["BENIGN"]`. Probabilities need not sum to one. The threshold
+is defined by `CATEGORY_THRESHOLD` in `app/schemas.py` and included in cache
+fingerprints. No separate benign probability is requested.
 
-After updating from the old labels, restart the application and run `POST /analyze` to replace stored classifications. The changed prompt/schema automatically invalidate the old cache. The analysis summary's `uncertain` count includes newly analyzed items with category or intent `UNCERTAIN`, or confidence below 0.65.
+Provider JSON must include all four probabilities and must omit category labels,
+severity, and overall confidence. An optional `explanation` string is accepted,
+so a fine-tuned model can return only the probability object above. The current
+Gemini and Chat Completions adapters use this same contract. A replacement
+provider implements `classify(context)` and returns a validated `Classification`
+and its raw response. No fine-tuned endpoint is configured yet.
+
+The message's own text determines its category; parent and target text supply
+context. Restart the application and run `POST /analyze` after updating. Database
+initialization clears legacy analyses containing severity, overall confidence or
+intent, and changed fingerprints trigger fresh analysis. The summary reports
+`benign` for successfully analyzed items with no probability meeting the threshold;
+errors are counted separately.
 
 All scoring lives in `app/risk_scoring.py`. For an eligible item:
 
 ```text
-points = 12 × severity × confidence × role_weight
+points_for_category = 36 × probability_for_category × role_weight
 role_weight = 1.0 for authored posts/comments, 0.75 for contextual harmful shares
-category_score = min(100, sum(strongest points per distinct incident in that category))
+category_score = min(100, sum(points from all eligible items in that category))
 overall_score = max(hate, harassment, violence, spam)
 ```
 
-Eligibility requires successful analysis, confidence ≥0.65, a harmful category, positive severity, and intent `ENDORSEMENT`. Likes and dislikes always contribute zero, regardless of classifier output. Uncertain, condemnation, counter-speech, reporting, and neutral results contribute zero. A comment is evaluated from its own classification, not its parent's labels. A share must have contextual evidence of endorsement. No score is copied between users.
+Eligibility requires successful analysis and a category probability ≥0.5. Likes and dislikes contribute zero. Comments and shares
+are evaluated from their own classification. No score is copied between users.
 
-An incident is a root post/thread. Multiple comments or shares by the same user in the same thread/category count only the strongest item. Distinct root posts accumulate and therefore capture repetition. This conservative rule can undercount separate incidents inside a long thread; it is an explicit MVP tradeoff. Exact repeated ingestion of the same IDs never adds risk. Scores are calculated from a database snapshot when requested, not persisted as stale totals.
 
-Evidence includes original text, classification explanation, intent, severity, confidence, provenance, incident ID, candidate points, actual per-category contributions, and exclusion reasons. If an eligible item has no contributions, a stronger or equal item already represents that incident/category. Totals cap at 100; the overall score uses the maximum category, so categories are not double-counted against each other.
+Each eligible post, comment, or share contributes separately, including multiple
+actions in the same thread. Repeated copies of the same content or interaction
+ID count once. Scores are calculated from the current database snapshot.
+
+Evidence includes original text, explanation, four category probabilities,
+provenance, candidate points, contributions, and exclusion reasons. Category
+totals cap at 100; overall is the highest category score. There is no incident
+grouping or parent-thread traversal in scoring.
 
 Thresholds: 0–24 Low, 25–49 Moderate, 50–74 High, 75–100 Critical. A score ≥25 sets `flag_for_review=true`. These are **demonstration thresholds, not validated moderation standards**; a flag requests human review and is not a conclusive judgment. Fictional names and the fictional Zorvian ethnicity are synthetic testing constructs.
 
-Demo reactions follow an explicit synthetic rule: likes copy all target categories and intent; dislikes copy all categories and swap `ENDORSEMENT` with `CONDEMNATION`. `NEUTRAL` and `UNCERTAIN` remain unchanged. Both reaction types have severity 1. User u20 likes and u18 dislikes each of the first 18 posts/comments, including counter-speech and neutral discussion. These are fixture assumptions; real LLM instructions remain conservative about reaction intent, and both reaction types still contribute zero risk. The mock model version is `fixture-replay-v3`, invalidating older cached mock results.
+Demo reactions use probabilities below 0.5 for all categories and contribute no
+risk. The mock model version is `fixture-replay-v5`, invalidating older cached
+mock results.
 
 ## Example output (mock only)
 
@@ -146,71 +174,66 @@ This offline command tests fixture classification/scoring without Neo4j and with
 
 These numbers are fixture-derived examples, **not observed LLM predictions**. Real provider output is probabilistic and requires evaluation; the automated safeguards still apply to its validated classifications.
 
-## Reddit polling worker
+## Streaming suspicious users
 
-The worker accepts seed accounts and prints canonical records as JSON lines. It
-does not write to Neo4j or call an LLM. Configure a Reddit OAuth application with
-access to the Reddit Data API, then add these settings to your local `.env`:
-
-```dotenv
-REDDIT_CLIENT_ID=your-client-id
-REDDIT_CLIENT_SECRET=your-client-secret
-REDDIT_USER_AGENT=python:social-sentinel:0.1 (by /u/your_username)
-```
-
-Run a single seed collection or start continuous polling:
+The live collector uses Bluesky Jetstream v2 WebSockets. It resolves the initial
+accounts once, fetches their recent posts and direct comments/likes/reposts once,
+then processes live events. Only the original seeds receive HTTP backfill.
+Discovered accounts are monitored from stream events without fetching their
+existing history. No Bluesky HTTP activity calls run after the socket starts.
 
 ```sh
-python -m scripts.poll_social --seed username1 username2 --once
-python -m scripts.poll_social --seed username1 username2 --interval 60 --max-users 100 --max-depth 1
+python -m scripts.stream_social --seed alice.bsky.social bob.bsky.social --max-users 100
+# Initial collection only, without opening a WebSocket:
+python -m scripts.stream_social --seed alice.bsky.social --once
 ```
 
-Seeds have depth 0. Observed commenters on their posts enter the `suspicious_pool`
-at depth 1 and are polled beginning with the next cycle. This pool is a discovery
-watchlist; membership does not assert harmful behavior or assign a score. Increase
-`--max-depth` to expand further, or set it to 0 to poll seeds only. `--max-users`
-caps the total pool, including seeds. `--once` runs one cycle, so it prints newly
-discovered users but does not poll those users yet. Stop continuous mode with Ctrl+C.
+The old `scripts.poll_social` command forwards to this same streaming command;
+`--interval` has been removed. `--page-size` (1–100, default 25) and `--max-pages`
+(default 2) bound the initial seed HTTP fetches. `--max-users` caps the pool including
+seeds. Direct activity is still emitted when an actor cannot enter the full pool.
+Use Ctrl+C to stop.
 
-Each cycle reads recent submitted posts and authored comments, then revisits the
-returned posts' comment trees to discover new participants even when a post's text
-has not changed. `--page-size` (default 25), `--max-pages` (default 2 per listing),
-and `--comment-limit` (default 100 per thread) bound collection. This is a recent
-activity preview, not a complete archive: older posts outside the listing window
-are not watched, and Reddit `more` comment placeholders are not expanded. A busy
-account can outpace the configured listing window. Deleted authors and removed
-content are omitted; inaccessible parent context may remain unavailable. Historical
-records, deletions, and polling state are not persisted in this print-only version.
+The subscription requests `app.bsky.feed.post`, `app.bsky.feed.like`, and
+`app.bsky.feed.repost` across all authors. Filtering only pool DIDs would miss
+unknown participants. The worker filters locally: keep top-level posts from pool
+members, comments whose immediate parent is a watched post, and likes/reposts
+whose target is a watched post. Replies to comments and reactions to comments are
+ignored. Pool membership does not classify an account as harmful.
+See the [official Jetstream protocol](https://bsky.network/docs/jetstream/).
 
-Output events have `type: User`, `Content`, or `Interaction` and a `record` matching
-the models in `app/schemas.py`. `pool_member` events additionally explain discovery
-and depth. Unchanged records are suppressed with a bounded in-memory cache; edits
-are printed again. Restarting or cache eviction can print an existing record again.
-Account failures are logged to stderr and retried next cycle without stopping other
-users. API requests are spaced and respect rate-limit backoff headers.
+Canonical `User`, `Content`, `Interaction`, and `pool_member` records are printed
+as JSON lines. Live participants initially use their DID as their display name;
+initial activity fetches can supply their handle. Edits are emitted again;
+unchanged records are suppressed by a bounded cache. Observed deletions emit
+`{"type":"delete","record_type":"Content","record_id":"at://..."}` (or
+`Interaction`). A reaction deletion can be identified only after its native
+record URI has been observed on the stream. Initial repost timestamps are empty
+because the HTTP listing omits them; stream records contain their creation time.
 
-The `SocialPlatform` protocol in `app/platforms/base.py` defines `resolve_user`,
-`poll_user`, and `close`. Other adapters return the same `PollResult` and
-`ActivityBatch`, using platform-namespaced IDs. `ActivityBatch` contains the existing
-`User`, `Content`, and `Interaction` types without requiring synthetic expected
-labels. `Dataset` extends it for fixture-only expectations. Live Reddit users set
-`is_synthetic=False`. Reddit posts use IDs such as `reddit:t3_abc`; comments use
-`reddit:t1_xyz`, with their actual immediate parent in `parent_id`. Comments are
-`Content`, not an invented interaction type. Public vote totals do not identify
-individual voters, so this adapter emits no like/dislike interactions or inferred
-shares. Its `interactions` list is currently empty.
+The worker reconnects with exponential backoff and an in-memory sequence cursor.
+Replay starts just before the initial fetch and resumes after disconnects, within
+Jetstream's replay window. Inclusive replay is deduplicated. Pool, watched posts,
+stream record mappings and cursor reset on restart; no durable checkpoint is
+implemented. Long disconnects outside the replay window can leave gaps. Initial
+HTTP failures are logged without stopping live monitoring; they are not retried
+automatically. Initial listings and thread responses may be truncated, so old
+posts outside the initial window and events predating admission can be missed.
+Pool size and the deduplication cache are bounded; watched-post and stream record
+indexes grow with the relevant activity during a run.
 
-The shared classifier context builder accepts these canonical models directly:
+Collection makes no database writes or LLM calls. Output remains compatible with
+the existing canonical activity models; deletion events are output notifications.
 
-```python
-result = platform.poll_user(platform.resolve_user('username'))
-for label, ident, context in contexts(result.activity.contents, result.activity.interactions):
-    # Hand context to a classifier when classification is explicitly enabled later.
-    print(label, ident, context)
-```
-
-Relevant Reddit contracts: [API listings and comments](https://www.reddit.com/dev/api/)
-and [application-only OAuth](https://github.com/reddit-archive/reddit/wiki/OAuth2#application-only-oauth).
+Seed handles, @handles, and DIDs are accepted by `resolve_user`.
+`User.user_id` stores the native DID (for example, `did:plc:...`), ready to pass
+directly to the API. `poll_user` uses it without resolving or fetching the profile
+again. Discovered users also store native DIDs.
+`Content.content_id` stores the native `at://...` URI, `Content.user_id` stores
+the author DID, and `parent_id` and interaction `target_id` store native post
+URIs. These IDs can be passed directly to the API without stripping prefixes.
+The available adapter is `app/platforms/bluesky.py`; Reddit and X adapters are not
+present in this checkout. `--platform bluesky` is optional.
 
 ## Tests
 
@@ -240,61 +263,59 @@ This is a local demonstration intended for synthetic data. No authentication, di
 
 The Python 3.13 test run completed with **65 passed, 1 skipped**. The skipped test requires live Neo4j. Docker is not installed in this workspace, so Compose startup and live graph queries were not exercised. No real LLM calls were made; the HTTP contract was tested with a mock transport. The generated example is fixture replay only.
 
-## X polling
+## Run collection, classification and scoring together
 
-Set `X_BEARER_TOKEN` in `.env` to an X API bearer token with access to the
-[user timeline](https://docs.x.com/x-api/users/get-posts),
-[mentions](https://docs.x.com/x-api/users/get-mentions), user lookup, and post lookup endpoints.
-Run a single account from the testing module:
+Configure Neo4j and your classifier in `.env`, then run:
 
 ```sh
-python -m app.testing --platform x username
+python -m app.testing alice.bsky.social bob.bsky.social --analysis-interval 60 --max-users 100
+# One initial collection/classification/scoring pass without streaming:
+python -m app.testing alice.bsky.social --once
 ```
 
-The shared worker also supports X:
+The runner initializes Neo4j and ingests initial users, posts, direct comments,
+likes and reposts. It runs Jetstream on the main thread; new records and
+edits are ingested continuously, and observed deletions are applied to the DB.
+Deleting content also deletes interactions targeting it; surviving comments are
+retained and their changed context is reconsidered at the next analysis cycle.
 
-```sh
-python -m scripts.poll_social --platform x --seed username --once
-```
+Classification/scoring runs in a daemon background thread. Later cycles
+wait `--analysis-interval` seconds after the previous cycle finishes, so cycles
+do not overlap. Each cycle reads the database and reuses successful analyses with
+matching fingerprints. New or edited content, changed parent/target context,
+provider/model/schema changes and failed analyses trigger fresh classification.
+Model calls run without holding the ingestion lock. Results for records edited
+or deleted during inference are discarded (`outdated`) and reconsidered next cycle.
 
-The read-only adapter collects recent authored posts and mentions, fetches up to
-two levels of missing reply parents, and discovers authors of returned mentions.
-Mentions include standalone mentions as well as replies; this does not collect
-complete conversation trees. User IDs use stable numeric IDs (`x:user:123`),
-content IDs use `x:post:456`, and replies are comments with their actual parent ID.
-Reposts are skipped; quotes retain their authored text as posts. No likes or
-shares are inferred. Collection is bounded by `--page-size` (5–100, default 25)
-and `--max-pages` (default 2 per timeline). `--comment-limit` applies only to Reddit.
-HTTP failures and wholly failed API payloads propagate to the caller; the shared
-worker retries accounts on later cycles. Partial responses retain available data.
-Requests honor rate-limit reset and retry headers on subsequent calls. No graph
-writes or LLM calls occur. Tests use mocked HTTP, not live X API access.
+After classification, the runner reads a fresh snapshot, gathers each user's own
+Content and Interactions, calls `score_user`, and persists the resulting summary
+on that User. Probabilities whose fingerprints no longer match are excluded from
+that scoring pass, and the user's `analysis_complete` is false. Stored properties
+include `overall_score`, `review_level`, `flag_for_review`, four
+`category_score_*` values, and `scores_updated_at`. `score_summary` stores the full
+summary as JSON because Neo4j properties cannot contain nested maps. Snapshots
+and graph output decode it back to ordinary summary fields. Evidence remains on
+content/interaction records and is calculated on demand.
 
-## Bluesky polling (atproto)
+Short database operations share a lock inside this runner. This is not a
+cross-process lock; run one pipeline writer for this workflow. Stream failures propagate directly on the main thread. There is no stop event,
+error queue, or stream-health checker. Ctrl+C exits the runner and closes the
+platform and database resources; background classification is not joined on exit.
+An uncaught classification error ends its background thread and is reported by
+Python; no automatic supervisor restarts it.
+The API continues to compute scores on demand; stored scores are the latest
+periodic snapshot, not an immediate update after every event.
 
-Install the updated dependencies (`python -m pip install -r requirements.txt`).
-The Bluesky adapter uses the Python `atproto` SDK against
-`https://public.api.bsky.app`; public reads require no credentials or login.
-See the [SDK reading guide](https://atproto.blue/guides/reading/) and
-[Bluesky API reference](https://docs.bsky.app/docs/api/app-bsky-feed-get-author-feed).
+`--page-size` and `--max-pages` bound initial fetches. The default `mock` provider
+only replays synthetic fixtures; live input requires a configured real provider
+for meaningful predictions. The standalone `scripts.stream_social` command stays
+a collection-only JSON output tool. Periodic DB writes and analysis are enabled
+by `app.testing`.
 
-```sh
-python -m app.testing --platform bluesky alice.bsky.social
-python -m scripts.poll_social --platform bluesky --seed alice.bsky.social --once
-python -m scripts.poll_social --platform bluesky --seed alice.bsky.social --interval 60 --max-depth 1
-```
 
-Handles, @handles, DIDs, and canonical `bluesky:user:did:...` IDs are accepted.
-Users are keyed by stable DIDs; content uses `bluesky:at://...` IDs and preserves
-actual immediate reply parents. Each poll reads up to `--max-pages` author-feed
-pages (`--page-size` 1–100), revisits the returned authored posts' threads, and
-collects returned replies to `--thread-depth` levels (default 2, range 0–100).
-The API may truncate threads; this is a recent activity preview, not an archive.
-Up to two missing ancestor levels are fetched in batches of 25 for context.
-Reply authors enter discovery; context-only authors do not. Reposts, blocked and
-deleted thread placeholders are skipped. Quotes retain the author's post text.
-No likes or shares are inferred, and no database writes or LLM calls occur.
-SDK/network errors propagate to the caller; the shared worker handles account
-failures and retries on later cycles. Reddit's `--comment-limit` does not apply.
-Tests use mocked SDK calls and real atproto models; no live Bluesky access is
-required to run the suite.
+## Training dataset
+
+The combined Jigsaw/Enron dataset is available in
+[dataset/combined.csv](dataset/combined.csv), with the exact columns
+`text,hate,harrasment,violence,spam`. See [dataset/README.md](dataset/README.md)
+for the label mappings and build command. All target columns contain only `0` or `1`.

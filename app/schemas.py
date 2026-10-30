@@ -1,40 +1,50 @@
 from typing import Annotated, Literal
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
-Category = Literal['HATE', 'HARASSMENT', 'VIOLENCE', 'SPAM', 'BENIGN', 'UNCERTAIN']
-Intent = Literal['ENDORSEMENT', 'CONDEMNATION', 'NEUTRAL', 'UNCERTAIN']
+Category = Literal['HATE', 'HARASSMENT', 'VIOLENCE', 'SPAM', 'BENIGN']
+
+HARMFUL_CATEGORIES = ('HATE', 'HARASSMENT', 'VIOLENCE', 'SPAM')
+CATEGORY_THRESHOLD = 0.5
+Probability = Annotated[float, Field(strict=True, ge=0, le=1, allow_inf_nan=False)]
+
+
+class CategoryProbabilities(BaseModel):
+    """Independent probabilities; they do not need to sum to one."""
+    model_config = ConfigDict(extra='forbid')
+    HATE: Probability
+    HARASSMENT: Probability
+    VIOLENCE: Probability
+    SPAM: Probability
+
 
 class Classification(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    category: Annotated[list[Category], Field(min_length=1, max_length=6)]
-    severity: Annotated[int, Field(strict=True, ge=0, le=3)]
-    confidence: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
-    intent: Intent
-    explanation: Annotated[str, Field(min_length=1, max_length=1200)]
+    probabilities: CategoryProbabilities
+    explanation: Annotated[str, Field(max_length=1200)] = ''
 
-    @model_validator(mode='after')
-    def consistent_categories(self):
-        if len(set(self.category)) != len(self.category):
-            raise ValueError('Duplicate categories')
-        if set(self.category) & {'BENIGN', 'UNCERTAIN'} and len(self.category) > 1:
-            raise ValueError('Non-harmful or uncertain categories must stand alone')
-        return self
+    @computed_field
+    @property
+    def category(self) -> list[Category]:
+        matched = [category for category, probability in self.probabilities.model_dump().items()
+                   if probability >= CATEGORY_THRESHOLD]
+        return matched or ['BENIGN']
 
 
 class User(BaseModel):
+    """Live user IDs are native IDs accepted directly by the platform API."""
     user_id: str
     display_name: str
     is_synthetic: bool = True
 
 
 class Content(BaseModel):
+    """Live content, author, and parent IDs are native API-ready IDs."""
     content_id: str
     user_id: str
     content_type: Literal['post', 'comment']
     text: str
     created_at: str
     parent_id: str | None = None
-
 
 class Interaction(BaseModel):
     interaction_id: str
@@ -51,14 +61,10 @@ class ActivityBatch(BaseModel):
     interactions: list[Interaction]
 
 
-class Dataset(ActivityBatch):
-    expected: dict[str, Classification]
-
-
 class AnalysisResult(BaseModel):
     classification: Classification
-    provider: str # 'mock' or 'chat-completions'
-    model: str # 'fixture-replay-v3' (for mock) or our configured model
+    provider: str # 'mock' or 'gemini'
+    model: str # 'fixture-replay-v5' (for mock) or our configured model
     """ 
         We keep provider and model because the same connection mode can call 
         different models, and we need to know which produced each result 

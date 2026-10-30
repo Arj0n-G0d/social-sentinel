@@ -3,18 +3,21 @@ import httpx
 import pytest
 from pydantic import ValidationError
 from app.config import Settings
-from app.demo_data import generate_demo_data
-from app.llm_classifier import ChatCompletionsProvider, Classifier, GeminiProvider
-from app.schemas import Classification
+from app.demo_data import generate_demo_data, generate_demo_labels
+from app.llm_classifier import Classifier, GeminiProvider
+from app.schemas import ActivityBatch, Classification
 from app.workflow import analyze_store, contexts
 
 
-def test_dataset_reproducible_and_complete():
+def test_activity_batch_reproducible_and_complete():
     first = generate_demo_data()
     assert first == generate_demo_data()
     assert 15 <= len(first.users) <= 25
     assert 30 <= len(first.contents) <= 50
-    assert len(first.expected) == len(first.contents) + len(first.interactions)
+    assert type(first) is ActivityBatch
+    assert set(first.model_dump()) == {'users', 'contents', 'interactions'}
+    assert set(generate_demo_labels()) == {c.content_id for c in first.contents} | {i.interaction_id for i in first.interactions}
+    assert len(generate_demo_labels()) == len(first.contents) + len(first.interactions)
     assert all(u.is_synthetic for u in first.users)
 
 
@@ -23,13 +26,13 @@ def test_mock_explicit_and_expected_labels_match(store, classifier):
     assert counts['provider'] == 'mock'
     assert 'is_mock' not in counts
     assert counts['errors'] == 0
-    assert counts['uncertain'] == sum(label.confidence < 0.65 or 'UNCERTAIN' in label.category or label.intent == 'UNCERTAIN'
-                                      for label in generate_demo_data().expected.values())
-    expected = generate_demo_data().expected
+    assert counts['benign'] == sum(label.category == ['BENIGN']
+                                      for label in generate_demo_labels().values())
+    expected = generate_demo_labels()
     for key, id_key in [('contents', 'content_id'), ('interactions', 'interaction_id')]:
         for node in store.data[key]:
             assert node['category'] == expected[node[id_key]].category
-            assert node['intent'] == expected[node[id_key]].intent
+            assert 'intent' not in node
             assert node['provider'] == 'mock' and 'MOCK' in node['explanation']
             assert 'is_mock' not in node
 
@@ -71,11 +74,25 @@ def test_comments_and_share_have_context(store):
     assert all('expected' not in ctx for _, _, ctx in rows)
 
 
-@pytest.mark.parametrize('update', [{'severity': 4}, {'severity': True}, {'severity': 1.5}, {'confidence': 1.1}, {'confidence': float('nan')}, {'category': []}, {'category': ['HATE','BENIGN']}, {'intent': 'SUPPORT'}, {'intent': 'PARTICIPATION'}, {'intent': 'AMPLIFICATION'}, {'intent': 'COUNTER_SPEECH'}, {'intent': 'REPORTING'}, {'category': ['COUNTER_SPEECH']}, {'extra': 'invalid'}])
-def test_validation(update):
-    payload = generate_demo_data().expected['c001'].model_dump()
+@pytest.mark.parametrize('probabilities', [
+    {}, {'HATE': 0.2},
+    dict(HATE=1.1, HARASSMENT=0.0, VIOLENCE=0.0, SPAM=0.0),
+    dict(HATE=float('nan'), HARASSMENT=0.0, VIOLENCE=0.0, SPAM=0.0),
+    dict(HATE=-0.1, HARASSMENT=0.0, VIOLENCE=0.0, SPAM=0.0),
+    dict(HATE=True, HARASSMENT=0.0, VIOLENCE=0.0, SPAM=0.0),
+    dict(HATE='0.5', HARASSMENT=0.0, VIOLENCE=0.0, SPAM=0.0),
+    dict(HATE=0.2, HARASSMENT=0.0, VIOLENCE=0.0, SPAM=0.0, BENIGN=0.8),
+])
+def test_invalid_probabilities_are_rejected(probabilities):
     with pytest.raises(ValidationError):
-        Classification.model_validate({**payload, **update})
+        Classification(probabilities=probabilities)
+
+
+@pytest.mark.parametrize('extra', [{'severity': 2}, {'confidence': 0.9}, {'intent': 'NEUTRAL'},
+                                   {'category': ['HATE']}])
+def test_model_returns_probabilities_only(extra):
+    with pytest.raises(ValidationError):
+        Classification(probabilities=dict.fromkeys(['HATE', 'HARASSMENT', 'VIOLENCE', 'SPAM'], 0.1), **extra)
 
 
 class FailingProvider:
@@ -87,49 +104,30 @@ class FailingProvider:
 
 
 @pytest.mark.parametrize('error', [ValueError('invalid JSON'), httpx.ConnectError('offline'), KeyError('choices')])
-def test_failures_are_uncertain_retryable_and_not_mock_fallback(store, error):
-    classifier = Classifier(Settings(_env_file=None, llm_provider='chat_completions', llm_model='test-model'), FailingProvider(error))
+def test_failures_are_zero_confidence_retryable_and_not_mock_fallback(store, error):
+    classifier = Classifier(Settings(_env_file=None, llm_provider='gemini', llm_model='test-model'), FailingProvider(error))
     first = analyze_store(store, classifier)
     second = analyze_store(store, classifier)
     assert first['errors'] == first['analyzed'] == second['analyzed']
-    assert first['provider'] == 'chat_completions'
-    assert all(n['severity'] == 0 and n['status'] == 'error'
-               and n['intent'] == 'UNCERTAIN' and n['category'] == ['UNCERTAIN']
+    assert first['provider'] == 'gemini'
+    assert all(all(p == 0 for p in n['probabilities'].values()) and n['status'] == 'error'
+               and 'intent' not in n and n['category'] == ['BENIGN']
                for n in store.data['contents'])
 
 
 def test_real_provider_requires_configuration():
     with pytest.raises(ValueError, match='requires'):
-        Classifier(Settings(_env_file=None, llm_provider='chat_completions', llm_api_key='', llm_model=''))
-
-
-def test_chat_completions_request_and_validation(monkeypatch):
-    expected = generate_demo_data().expected['c001']
-    captured = []
-    def handler(request):
-        captured.append(request)
-        return httpx.Response(200, json={'choices': [{'message': {'content': expected.model_dump_json()}}]})
-    actual_client = httpx.Client
-    monkeypatch.setattr('app.llm_classifier.httpx.Client', lambda **kwargs: actual_client(transport=httpx.MockTransport(handler), **kwargs))
-    config = Settings(_env_file=None, llm_provider='chat_completions', llm_api_key='test-only-key',
-                      llm_model='configured-model', llm_base_url='https://provider.example/v1')
-    classification, raw = ChatCompletionsProvider(config).classify({'text': 'synthetic text'})
-    assert classification == expected
-    body = json.loads(captured[0].content)
-    assert body['model'] == 'configured-model'
-    assert body['response_format'] == {'type': 'json_object'}
-    assert 'expected' not in body['messages'][1]['content']
-    assert raw
+        Classifier(Settings(_env_file=None, llm_provider='gemini', llm_api_key='', llm_model=''))
 
 
 def test_gemini_request_and_validation(monkeypatch):
-    expected = generate_demo_data().expected['c001']
+    expected = generate_demo_labels()['c001']
     captured = []
 
     def handler(request):
         captured.append(request)
         return httpx.Response(200, json={'candidates': [{'content': {
-            'parts': [{'text': expected.model_dump_json()}]}}]})
+            'parts': [{'text': expected.model_dump_json(exclude={'category'})}]}}]})
 
     actual_client = httpx.Client
     monkeypatch.setattr('app.llm_classifier.httpx.Client', lambda **kwargs: actual_client(
@@ -151,42 +149,33 @@ def test_gemini_request_and_validation(monkeypatch):
     assert body['generationConfig']['responseMimeType'] == 'application/json'
 
 
-def test_uncertain_intent_with_known_category_is_valid_and_counted(store, classifier):
-    class UnclearStanceProvider:
-        def classify(self, context):
-            result = Classification(category=['HATE'], severity=0, confidence=0.9,
-                                    intent='UNCERTAIN', explanation='Topic known; stance unclear.')
-            return result, result.model_dump_json()
-
-    classifier.provider = UnclearStanceProvider()
-    counts = analyze_store(store, classifier)
-    assert counts['errors'] == 0
-    assert counts['uncertain'] == counts['analyzed']
+@pytest.mark.parametrize('hate,spam,expected', [
+    (0.49, 0.1, ['BENIGN']), (0.5, 0.1, ['HATE']),
+    (0.9, 0.8, ['HATE', 'SPAM']), (0.0, 0.0, ['BENIGN']),
+])
+def test_categories_derived_independently(hate, spam, expected):
+    result = Classification(probabilities=dict(HATE=hate, HARASSMENT=0.0, VIOLENCE=0.0, SPAM=spam))
+    assert result.category == expected
+    assert result.model_dump()['category'] == expected
 
 
-def test_demo_reaction_labels_follow_explicit_synthetic_target_stances():
+def test_demo_reactions_below_threshold():
     data = generate_demo_data()
-    like = next(i for i in data.interactions if i.user_id == 'u04')
-    dislike = next(i for i in data.interactions if i.user_id == 'u18')
-    assert data.expected[like.interaction_id].category == ['HATE']
-    assert data.expected[like.interaction_id].intent == 'ENDORSEMENT'
-    assert data.expected[like.interaction_id].severity == 1
-    assert data.expected[dislike.interaction_id].category == ['HATE']
-    assert data.expected[dislike.interaction_id].intent == 'CONDEMNATION'
-    assert data.expected[dislike.interaction_id].severity == 1
-    for reaction in (i for i in data.interactions if i.user_id == 'u20'):
-        expected = data.expected[reaction.interaction_id]
-        assert expected.category == data.expected[reaction.target_id].category
-        assert expected.intent == data.expected[reaction.target_id].intent
-
-    opposite = {'ENDORSEMENT': 'CONDEMNATION', 'CONDEMNATION': 'ENDORSEMENT',
-                'NEUTRAL': 'NEUTRAL', 'UNCERTAIN': 'UNCERTAIN'}
     for reaction in data.interactions:
-        if reaction.interaction_type not in {'like', 'dislike'}:
-            continue
-        target = data.expected[reaction.target_id]
-        result = data.expected[reaction.interaction_id]
-        assert result.category == target.category
-        assert result.severity == 1
-        assert result.intent == (target.intent if reaction.interaction_type == 'like'
-                                 else opposite[target.intent])
+        if reaction.interaction_type in {'like', 'dislike'}:
+            result = generate_demo_labels()[reaction.interaction_id]
+            assert result.category == ['BENIGN']
+            assert set(result.probabilities.model_dump()) == {'HATE', 'HARASSMENT', 'VIOLENCE', 'SPAM'}
+
+
+def test_unknown_mock_input_has_zero_probabilities():
+    classifier = Classifier(Settings(_env_file=None, llm_provider='mock'))
+    result = classifier.analyze({'text': 'not a fixture'})
+    assert result.classification.category == ['BENIGN']
+    assert all(p == 0 for p in result.classification.probabilities.model_dump().values())
+
+
+def test_prompt_requests_four_probabilities():
+    from app.llm_classifier import SYSTEM_PROMPT
+    assert all(name in SYSTEM_PROMPT for name in ['HATE', 'HARASSMENT', 'VIOLENCE', 'SPAM'])
+    assert 'independent probability' in SYSTEM_PROMPT

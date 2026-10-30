@@ -3,3 +3,8 @@
 __pycache__/
 .pytest_cache/
 *.pyc
+
+# Downloaded source dataset cache (reproducible via dataset/create.py).
+/dataset/raw/
+
+/dataset/combined.csv
