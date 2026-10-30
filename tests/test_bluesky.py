@@ -160,3 +160,11 @@ def test_invalid_account_input_is_rejected_before_api_call(handle):
     with pytest.raises(ValueError, match='full handle'):
         platform.resolve_user(handle)
     client.get_profile.assert_not_called()
+
+
+@pytest.mark.parametrize('display_name,expected', [('Alice Example', 'Alice Example'), ('', 'seed.bsky.social'), (None, 'seed.bsky.social')])
+def test_profile_display_name_with_handle_fallback(display_name, expected):
+    client = Mock()
+    client.get_profile.return_value = NS(did=DID, handle='seed.bsky.social', display_name=display_name)
+    assert BlueskyPlatform(client=client).resolve_user(DID).display_name == expected
+    client.get_profile.assert_called_once_with(DID)

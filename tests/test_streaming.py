@@ -254,3 +254,69 @@ def test_live_discovery_never_fetches_http_activity():
     with pytest.raises(KeyboardInterrupt):
         result.run(connector=connector)
     assert set(result.suspicious_pool) == {SEED, READER, 'did:plc:third'}
+
+
+def test_new_stream_actor_fetches_profile_once_and_emits_display_name():
+    from types import SimpleNamespace as NS
+    from unittest.mock import Mock
+    from app.platforms.bluesky import BlueskyPlatform
+
+    client = Mock()
+    client.get_profile.side_effect = [
+        NS(did=SEED, handle='seed.bsky.social', display_name='Seed Person'),
+        NS(did=READER, handle='reader.bsky.social', display_name='Reader Person')]
+    platform = BlueskyPlatform(client=client)
+    platform.poll_user = Mock(return_value=Platform().poll_user(user(SEED)))
+    events = []
+    result = StreamingWorker(platform, [SEED], emit=events.append)
+    result.bootstrap()
+    result.process_event(comment())
+    result.process_event(comment(key='another'))
+    assert [call.args[0] for call in client.get_profile.call_args_list] == [SEED, READER]
+    assert result.suspicious_pool[READER].display_name == 'Reader Person'
+    actor = next(e['record'] for e in events if e['type'] == 'User' and e['record']['user_id'] == READER)
+    assert actor['display_name'] == 'Reader Person'
+    admitted = next(e for e in events if e['type'] == 'pool_member' and e['user']['user_id'] == READER)
+    assert admitted['user']['display_name'] == 'Reader Person'
+
+
+def test_unrelated_or_malformed_events_do_not_resolve_profiles():
+    from unittest.mock import Mock
+
+    result, _, platform = worker()
+    platform.resolve_user = Mock(side_effect=AssertionError('Unexpected lookup'))
+    result.process_event(commit(did=READER))
+    result.process_event(comment(parent='at://unknown/post'))
+    with pytest.raises(KeyError):
+        result.process_event(commit(did=READER, record={'reply': {'parent': {'uri': POST}}}))
+    platform.resolve_user.assert_not_called()
+
+
+def test_profiles_are_cached_even_when_pool_is_full():
+    from unittest.mock import Mock
+
+    result, events, platform = worker(max_users=1)
+    platform.resolve_user = Mock(return_value=User(
+        user_id=READER, display_name='Reader Person', is_synthetic=False))
+    result.process_event(comment())
+    result.process_event(comment(key='another'))
+    platform.resolve_user.assert_called_once_with(READER)
+    assert READER not in result.suspicious_pool
+    assert next(e['record'] for e in events if e['type'] == 'User'
+                and e['record']['user_id'] == READER)['display_name'] == 'Reader Person'
+
+
+def test_failed_profile_lookup_is_not_cached_and_can_retry(caplog):
+    from unittest.mock import Mock
+
+    result, events, platform = worker()
+    events.clear()
+    platform.resolve_user = Mock(side_effect=[RuntimeError('secret'), User(
+        user_id=READER, display_name='Reader Person', is_synthetic=False)])
+    result.process_event(comment())
+    assert events == []
+    assert READER not in result.suspicious_pool
+    result.process_event(comment())
+    assert result.suspicious_pool[READER].display_name == 'Reader Person'
+    assert platform.resolve_user.call_count == 2
+    assert 'secret' not in caplog.text

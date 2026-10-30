@@ -1,4 +1,4 @@
-"""One-time collection plus Jetstream live discovery. No graph or LLM calls."""
+"""One-time collection plus Jetstream discovery and new-user profile lookups."""
 from collections import OrderedDict
 import json
 import logging
@@ -37,6 +37,7 @@ class StreamingWorker:
         self.suspicious_pool: dict[str, User] = resolved
         self._seeds = tuple(resolved.values())
         self._seen: OrderedDict[tuple[str, str], str] = OrderedDict()
+        self._profiles: OrderedDict[str, User] = OrderedDict()
         self._announced: set[str] = set()
         self._fetched: set[str] = set()
         self.posts: dict[str, str] = {}
@@ -49,6 +50,10 @@ class StreamingWorker:
             if isinstance(record, Content) and record.content_type == 'post':
                 self.posts[record.content_id] = record.user_id
             if isinstance(record, User):
+                self._profiles[record.user_id] = record
+                self._profiles.move_to_end(record.user_id)
+                if len(self._profiles) > self.dedup_capacity:
+                    self._profiles.popitem(last=False)
                 if record.user_id in self.suspicious_pool:
                     self.suspicious_pool[record.user_id] = record
                 kind, ident = 'User', record.user_id
@@ -99,7 +104,7 @@ class StreamingWorker:
                 self._admit(discovered, user.user_id)
 
     def process_event(self, event: dict) -> None:
-        """Handle a decoded Jetstream v2 commit envelope without API calls."""
+        """Handle a commit, fetching a profile only for a newly observed actor."""
         payload = event.get('payload', {})
         if not isinstance(payload, dict):
             raise ValueError('Invalid Jetstream payload')
@@ -121,8 +126,6 @@ class StreamingWorker:
         if operation not in {'create', 'update'}:
             return
         record = payload['record']
-        actor = self.suspicious_pool.get(did) or User(
-            user_id=did, display_name=did, is_synthetic=False)
         content, interaction, source = None, None, None
         if collection == 'app.bsky.feed.post':
             parent = record.get('reply', {}).get('parent', {}).get('uri')
@@ -147,6 +150,15 @@ class StreamingWorker:
         else:
             return
         # Validate before admitting a participant or emitting activity.
+        actor = self.suspicious_pool.get(did) or self._profiles.get(did)
+        if actor is None:
+            try:
+                # BlueskyPlatform.resolve_user delegates to client.get_profile().
+                actor = self.platform.resolve_user(did)
+            except Exception as exc:
+                logger.warning('Profile lookup failed for %s (%s); skipping activity',
+                               did, type(exc).__name__)
+                return
         if source:
             self._admit(actor, source)
         self._records(ActivityBatch(users=[actor], contents=[content] if content else [],

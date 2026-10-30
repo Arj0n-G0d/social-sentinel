@@ -1,4 +1,5 @@
 from typing import Literal
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -8,6 +9,8 @@ class Settings(BaseSettings):
     neo4j_user: str = ''
     neo4j_password: str = ''
     neo4j_database: str = ''
+    bluesky_handle: str = ''
+    bluesky_app_password: SecretStr = SecretStr('')
     llm_provider: Literal['mock', 'chat_completions', 'gemini'] = 'mock'
     llm_base_url: str = ''
     llm_api_key: str = ''

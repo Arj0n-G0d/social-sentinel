@@ -7,10 +7,10 @@ from app.schemas import ActivityBatch, AnalysisResult, HARMFUL_CATEGORIES
 
 
 class GraphStore:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, neo4j_database: str = None):
         self.driver = GraphDatabase.driver(settings.neo4j_uri,
                                            auth=(settings.neo4j_user, settings.neo4j_password))
-        self.database = settings.neo4j_database
+        self.database = neo4j_database if neo4j_database else settings.neo4j_database
 
     def close(self):
         self.driver.close()
